@@ -17,6 +17,8 @@
 #include "UnrealSharpCore/CSDeveloperSettings.h"
 #include "Framework/Notifications/NotificationManager.h"
 #include "Interfaces/IMainFrameModule.h"
+#include "Interfaces/IPluginManager.h"
+#include "Kismet2/DebuggerCommands.h"
 #include "Misc/ScopedSlowTask.h"
 #include "Reinstancing/CSReinstancer.h"
 #include "Slate/CSNewProjectWizard.h"
@@ -81,6 +83,7 @@ void FUnrealSharpEditorModule::StartupModule()
 	RegisterMenu();
 	RegisterGameplayTags();
 	RegisterAssetTypes();
+	RegisterCollisionProfile();
 }
 
 void FUnrealSharpEditorModule::ShutdownModule()
@@ -92,7 +95,7 @@ void FUnrealSharpEditorModule::ShutdownModule()
 
 void FUnrealSharpEditorModule::OnCSharpCodeModified(const TArray<FFileChangeData>& ChangedFiles)
 {
-	if (IsHotReloading())
+	if (IsHotReloading() || FPlayWorldCommandCallbacks::IsInPIE())
 	{
 		return;
 	}
@@ -263,6 +266,17 @@ void FUnrealSharpEditorModule::OnReportBug()
 	FPlatformProcess::LaunchURL(TEXT("https://github.com/UnrealSharp/UnrealSharp/issues"), nullptr, nullptr);
 }
 
+void FUnrealSharpEditorModule::OnRefreshRuntimeGlue() const
+{
+	ProcessAssetIds();
+	ProcessGameplayTags();
+	ProcessAssetTypes();
+	ProcessTraceTypeQuery();
+
+	// Let external modules act on the runtime glue refresh, if they want to.
+	OnRefreshRuntimeGlueDelegate.Broadcast();
+}
+
 void FUnrealSharpEditorModule::OnExploreArchiveDirectory(FString ArchiveDirectory)
 {
 	FPlatformProcess::ExploreFolder(*ArchiveDirectory);
@@ -328,7 +342,8 @@ void FUnrealSharpEditorModule::OpenSolution()
 	}
 	
 	FString OpenSolutionArgs = FString::Printf(TEXT("/c \"%s\""), *SolutionPath);
-	FPlatformProcess::ExecProcess(TEXT("cmd.exe"), *OpenSolutionArgs, nullptr, nullptr, nullptr);
+	FPlatformProcess::CreateProc(TEXT("cmd.exe"), *OpenSolutionArgs, true, true, false, nullptr, 0, nullptr, nullptr);
+
 };
 
 FString FUnrealSharpEditorModule::SelectArchiveDirectory()
@@ -402,6 +417,13 @@ TSharedRef<SWidget> FUnrealSharpEditorModule::GenerateUnrealSharpMenu()
 		FSlateIcon(FAppStyle::Get().GetStyleSetName(), "MainFrame.ReportABug"));
 
 	MenuBuilder.EndSection();
+
+	MenuBuilder.BeginSection("Glue", LOCTEXT("Glue", "Glue"));
+
+	MenuBuilder.AddMenuEntry(CSCommands.RefreshRuntimeGlue, NAME_None, TAttribute<FText>(), TAttribute<FText>(),
+		FSlateIcon(FAppStyle::GetAppStyleSetName(), "SourceControl.Actions.Refresh"));
+
+	MenuBuilder.EndSection();
 	
 	return MenuBuilder.MakeWidget();
 }
@@ -459,6 +481,7 @@ void FUnrealSharpEditorModule::RegisterCommands()
 	UnrealSharpCommands->MapAction(FCSCommands::Get().OpenSettings, FExecuteAction::CreateStatic(&FUnrealSharpEditorModule::OnOpenSettings));
 	UnrealSharpCommands->MapAction(FCSCommands::Get().OpenDocumentation, FExecuteAction::CreateStatic(&FUnrealSharpEditorModule::OnOpenDocumentation));
 	UnrealSharpCommands->MapAction(FCSCommands::Get().ReportBug, FExecuteAction::CreateStatic(&FUnrealSharpEditorModule::OnReportBug));
+	UnrealSharpCommands->MapAction(FCSCommands::Get().RefreshRuntimeGlue, FExecuteAction::CreateRaw(this, &FUnrealSharpEditorModule::OnRefreshRuntimeGlue));
 
 	const FLevelEditorModule& LevelEditorModule = FModuleManager::GetModuleChecked<FLevelEditorModule>("LevelEditor");
 	const TSharedRef<FUICommandList> Commands = LevelEditorModule.GetGlobalLevelEditorActions();
@@ -497,9 +520,16 @@ void FUnrealSharpEditorModule::RegisterAssetTypes()
 		FSimpleMulticastDelegate::FDelegate::CreateStatic(&FUnrealSharpEditorModule::OnCompletedInitialScan));
 }
 
-void FUnrealSharpEditorModule::SaveRuntimeGlue(const FCSScriptBuilder& ScriptBuilder, const FString& FileName)
+void FUnrealSharpEditorModule::RegisterCollisionProfile()
 {
-	const FString Path = FPaths::Combine(FCSProcHelper::GetScriptFolderDirectory(), TEXT("ProjectGlue"), FileName + TEXT(".cs"));
+	UCollisionProfile* CollisionProfile = UCollisionProfile::Get();
+	CollisionProfile->OnLoadProfileConfig.AddStatic(&FUnrealSharpEditorModule::OnCollisionProfileLoaded);
+	ProcessTraceTypeQuery();
+}
+
+void FUnrealSharpEditorModule::SaveRuntimeGlue(const FCSScriptBuilder& ScriptBuilder, const FString& FileName, const FString& Suffix)
+{
+	const FString Path = FPaths::Combine(FCSProcHelper::GetProjectGlueFolderPath(), FileName + Suffix);
 	if (!FFileHelper::SaveStringToFile(ScriptBuilder.ToString(), *Path))
 	{
 		UE_LOG(LogUnrealSharpEditor, Error, TEXT("Failed to save %s"), *FileName);
@@ -586,10 +616,40 @@ void FUnrealSharpEditorModule::OnInMemoryAssetDeleted(UObject* Object)
 	WaitUpdateAssetTypes();
 }
 
+void FUnrealSharpEditorModule::OnCollisionProfileLoaded(UCollisionProfile* Profile)
+{
+	GEditor->GetTimerManager()->SetTimerForNextTick(FTimerDelegate::CreateStatic(&FUnrealSharpEditorModule::ProcessTraceTypeQuery));
+}
+
 void FUnrealSharpEditorModule::OnAssetManagerSettingsChanged(UObject* Object, FPropertyChangedEvent& PropertyChangedEvent)
 {
 	WaitUpdateAssetTypes();
 	GEditor->GetTimerManager()->SetTimerForNextTick(FTimerDelegate::CreateStatic(&FUnrealSharpEditorModule::ProcessAssetTypes));
+}
+
+bool FUnrealSharpEditorModule::FillTemplateFile(const FString& TemplateName, TMap<FString, FString>& Replacements, const FString& Path)
+{
+	const FString FullFileName = FCSProcHelper::GetPluginDirectory() / TEXT("Templates") / TemplateName + TEXT(".cs.template");
+
+	FString OutTemplate;
+	if (FFileHelper::LoadFileToString(OutTemplate, *FullFileName))
+	{
+		for (const TPair<FString, FString>& Replacement : Replacements)
+		{
+			FString ReplacementKey = TEXT("%") + Replacement.Key + TEXT("%");
+			OutTemplate = OutTemplate.Replace(*ReplacementKey, *Replacement.Value);
+		}
+
+		if (!FFileHelper::SaveStringToFile(OutTemplate, *Path))
+		{
+			UE_LOG(LogUnrealSharpEditor, Error, TEXT("Failed to save %s when trying to create a template"), *Path);
+			return false;
+		}
+		
+		return true;
+	}
+
+	return false;
 }
 
 void FUnrealSharpEditorModule::WaitUpdateAssetTypes()
@@ -652,7 +712,7 @@ void FUnrealSharpEditorModule::ProcessGameplayTags()
 			}
 		}
 	}
-
+	
 	ScriptBuilder.CloseBrace();
 	SaveRuntimeGlue(ScriptBuilder, TEXT("GameplayTags"));
 }
@@ -726,6 +786,56 @@ void FUnrealSharpEditorModule::ProcessAssetTypes()
 
 	ScriptBuilder.CloseBrace();
 	SaveRuntimeGlue(ScriptBuilder, TEXT("AssetTypes"));
+}
+
+void FUnrealSharpEditorModule::ProcessTraceTypeQuery()
+{
+	// Initialize CollisionProfile in-case it's not loaded yet
+	UCollisionProfile::Get();
+	
+	FCSScriptBuilder ScriptBuilder(FCSScriptBuilder::IndentType::Tabs);
+	ScriptBuilder.AppendLine();
+	ScriptBuilder.AppendLine(TEXT("using UnrealSharp.Engine;"));
+	ScriptBuilder.AppendLine();
+	ScriptBuilder.AppendLine(TEXT("public enum ETraceChannel"));
+	ScriptBuilder.OpenBrace();
+
+	// Hardcoded values for Visibility and Camera. See CollisionProfile.cpp:356
+	{
+		ScriptBuilder.AppendLine(TEXT("Visibility = 0,"));
+		ScriptBuilder.AppendLine(TEXT("Camera = 1,"));
+	}
+
+	UEnum* TraceTypeQueryEnum = StaticEnum<ETraceTypeQuery>();
+	constexpr int32 NumChannels = TraceTypeQuery_MAX;
+	constexpr int32 StartIndex = 2;
+	
+	for (int i = StartIndex; i < NumChannels; i++)
+	{
+		if (TraceTypeQueryEnum->HasMetaData(TEXT("Hidden"), i) || i == NumChannels - 1)
+		{
+			continue;
+		}
+		
+		FString ChannelName = TraceTypeQueryEnum->GetMetaData(TEXT("ScriptName"), i);
+		ChannelName.RemoveFromStart(TEXT("ECC_"));
+		ScriptBuilder.AppendLine(FString::Printf(TEXT("%s = %d,"), *ChannelName, i));
+	}
+
+	ScriptBuilder.CloseBrace();
+
+	ScriptBuilder.AppendLine();
+	ScriptBuilder.AppendLine(TEXT("public static class TraceChannelStatics"));
+	ScriptBuilder.OpenBrace();
+	
+	ScriptBuilder.AppendLine(TEXT("public static ETraceTypeQuery ToQuery(this ETraceChannel traceTypeQueryHelper)"));
+	ScriptBuilder.OpenBrace();
+	ScriptBuilder.AppendLine(TEXT("return (ETraceTypeQuery)traceTypeQueryHelper;"));
+	ScriptBuilder.CloseBrace();
+	
+	ScriptBuilder.CloseBrace();
+	
+	SaveRuntimeGlue(ScriptBuilder, TEXT("TraceChannel"));
 }
 
 FSlateIcon FUnrealSharpEditorModule::GetMenuIcon() const

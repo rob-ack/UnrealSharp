@@ -16,8 +16,8 @@ public class UnrealSharpCore : ModuleRules
 		_managedBinariesPath = Path.Combine(PluginDirectory, "Binaries", "Managed");
 		_engineGluePath = Path.Combine(_managedPath, "UnrealSharp", "UnrealSharp", "Generated");
 		
-		PublicDefinitions.Add("GENERATED_GLUE_PATH=" + _engineGluePath);
-		PublicDefinitions.Add("PLUGIN_PATH=" + PluginDirectory);
+		PublicDefinitions.Add("GENERATED_GLUE_PATH=" + _engineGluePath.Replace("\\","/"));
+		PublicDefinitions.Add("PLUGIN_PATH=" + PluginDirectory.Replace("\\","/"));
 		PublicDefinitions.Add("BUILDING_EDITOR=" + (Target.bBuildEditor ? "1" : "0"));
 		
 		PublicDependencyModuleNames.AddRange(
@@ -43,7 +43,8 @@ public class UnrealSharpCore : ModuleRules
 				"UnrealSharpProcHelper", 
 				"EnhancedInput", 
 				"UnrealSharpUtilities",
-				"GameplayTags"
+				"GameplayTags", 
+				"AIModule"
 			}
 			);
 
@@ -56,7 +57,8 @@ public class UnrealSharpCore : ModuleRules
 			PrivateDependencyModuleNames.AddRange(new string[]
 			{
 				"UnrealEd", 
-				"EditorSubsystem", 
+				"EditorSubsystem",
+				"BlueprintGraph"
 			});
 			
 			PublishSolution(Path.Combine(_managedPath, "UnrealSharpPrograms"));

@@ -14,9 +14,10 @@ class UNREALSHARPCORE_API UCSClass : public UBlueprintGeneratedClass
 {
 	GENERATED_BODY()
 public:
-	friend FCSGeneratedClassBuilder;
 
-	TSharedRef<FCSharpClassInfo> GetClassInfo() const;
+	TSharedRef<const FCSharpClassInfo> GetClassInfo() const;
+	bool CanTick() const { return bCanTick; }
+	void SetClassMetaData(const TSharedPtr<FCSharpClassInfo>& InClassMetaData);
 
 private:
 
