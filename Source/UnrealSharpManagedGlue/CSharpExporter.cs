@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -191,12 +192,12 @@ public static class CSharpExporter
             _modulesWriteInfo.Add(packageName, lastEditTime);
         }
 
-        HashSet<string> processedDirectories = new();
+        ConcurrentBag<string> processedDirectories = new();
 
         string generatedPath = FileExporter.GetDirectoryPath(package);
         bool doesDirectoryExist = Directory.Exists(generatedPath);
 
-        foreach (UhtType child in package.Children)
+        Parallel.ForEach(package.Children, child =>
         {
             string directoryName = Path.GetDirectoryName(child.HeaderFile.FilePath)!;
 
@@ -210,7 +211,7 @@ public static class CSharpExporter
             {
                 ForEachChild(child, FileExporter.AddUnchangedType);
             }
-        }
+        });
 
         if (processedDirectories.Count == 0)
         {
@@ -219,7 +220,7 @@ public static class CSharpExporter
         }
 
         // The glue has been exported, so we need to update the last write times
-        UpdateLastWriteTimes(processedDirectories, lastEditTime!);
+        UpdateLastWriteTimes(processedDirectories.Distinct().ToArray(), lastEditTime!);
     }
 
     private static void ForEachChild(UhtType child, Action<UhtType> action)
@@ -265,7 +266,7 @@ public static class CSharpExporter
         return !lastEditTime.DirectoryToWriteTime.TryGetValue(directoryPath, out DateTime lastEditTimeValue) || lastEditTimeValue != cachedTime;
     }
 
-    private static void UpdateLastWriteTimes(HashSet<string> directories, ModuleFolders lastEditTime)
+    private static void UpdateLastWriteTimes(IReadOnlyCollection<string> directories, ModuleFolders lastEditTime)
     {
         foreach (string directory in directories)
         {
